@@ -1,0 +1,5 @@
+data/
+database/
+venv/
+__pycache__/
+*.Zone.Identifier
