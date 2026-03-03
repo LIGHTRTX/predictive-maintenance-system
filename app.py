@@ -1,74 +1,78 @@
-import streamlit as st
-import numpy as np
-import pandas as pd
+from fastapi import FastAPI
+from pydantic import BaseModel
 import joblib
-import plotly.graph_objects as go
+import numpy as np
 
-from src.vibration import generate_signal, compute_rms
-from src.risk_engine import overload_ratio, unified_risk, classify
-from src.database import init_db, insert_log
+app = FastAPI()
 
-st.set_page_config(page_title="AI Predictive Maintenance", layout="wide")
+model = joblib.load("failure_model.pkl")
+scaler = joblib.load("scaler.pkl")
 
-model = joblib.load("models/failure_model.pkl")
-scaler = joblib.load("models/scaler.pkl")
+RATED_CURRENT = 5.0
 
-conn = init_db()
+class SensorInput(BaseModel):
+    air_temp: float
+    process_temp: float
+    speed: float
+    torque: float
+    tool_wear: float
 
-st.title("AI Predictive Maintenance System")
 
-col1, col2, col3, col4, col5 = st.columns(5)
+def overload_ratio(current, rated_current=RATED_CURRENT):
+    return current / rated_current
 
-air_temp = col1.slider("Air Temperature [K]", 295.0, 320.0, 300.0)
-process_temp = col2.slider("Process Temperature [K]", 305.0, 340.0, 310.0)
-rpm = col3.slider("Rotational Speed [rpm]", 1000.0, 2000.0, 1500.0)
-torque = col4.slider("Torque [Nm]", 10.0, 70.0, 40.0)
-tool_wear = col5.slider("Tool Wear [min]", 0.0, 250.0, 100.0)
 
-input_data = np.array([[air_temp, process_temp, rpm, torque, tool_wear]])
-scaled = scaler.transform(input_data)
-failure_prob = model.predict_proba(scaled)[0][1]
+def generate_signal(over_ratio):
+    t = np.linspace(0, 1, 1000)
+    base = 0.3*np.sin(2*np.pi*30*t) + 0.05*np.random.randn(1000)
+    if over_ratio > 1.5:
+        base += 0.4*np.sin(2*np.pi*200*t)
+    return base
 
-current = torque * 0.1
-over_ratio = overload_ratio(current)
 
-signal = generate_signal(over_ratio)
-rms_value = compute_rms(signal)
+def compute_rms(signal):
+    return np.sqrt(np.mean(signal**2))
 
-risk_score = unified_risk(failure_prob, over_ratio, rms_value)
-status, color = classify(risk_score)
 
-insert_log(conn, {
-    "air_temp": air_temp,
-    "process_temp": process_temp,
-    "rpm": rpm,
-    "torque": torque,
-    "current": current,
-    "failure_prob": failure_prob,
-    "overload_ratio": over_ratio,
-    "rms": rms_value,
-    "risk_score": risk_score,
-    "status": status
-})
+def unified_risk(failure_prob, over_ratio, rms):
+    normalized_overload = min(over_ratio/2, 1)
+    normalized_rms = min(rms/0.5, 1)
+    return 0.4*failure_prob + 0.3*normalized_overload + 0.3*normalized_rms
 
-st.markdown("---")
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Failure Probability", f"{failure_prob*100:.2f}%")
-m2.metric("Overload Ratio", f"{over_ratio:.2f}")
-m3.metric("Vibration RMS", f"{rms_value:.3f}")
-m4.metric("Risk Score", f"{risk_score:.2f}")
+def classify(risk_score):
+    if risk_score < 0.4:
+        return "Normal"
+    elif risk_score < 0.7:
+        return "Warning"
+    else:
+        return "Critical"
 
-st.markdown(f"<h2 style='color:{color};'>{status}</h2>", unsafe_allow_html=True)
 
-st.markdown("---")
+@app.post("/predict")
+def predict(data: SensorInput):
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(y=signal))
-fig.update_layout(template="plotly_dark", height=300)
-st.plotly_chart(fig, use_container_width=True)
+    X = np.array([[data.air_temp,
+                   data.process_temp,
+                   data.speed,
+                   data.torque,
+                   data.tool_wear]])
 
-st.markdown("---")
+    X_scaled = scaler.transform(X)
+    failure_prob = model.predict_proba(X_scaled)[0][1]
 
-df_logs = pd.read_sql_query("SELECT * FROM logs ORDER BY id DESC LIMIT 20", conn)
-st.dataframe(df_logs)
+    over_ratio = overload_ratio(data.torque)
+
+    signal = generate_signal(over_ratio)
+    rms = compute_rms(signal)
+
+    risk_score = unified_risk(failure_prob, over_ratio, rms)
+    status = classify(risk_score)
+
+    return {
+        "failure_probability": float(failure_prob),
+        "overload_ratio": float(over_ratio),
+        "rms_vibration": float(rms),
+        "risk_score": float(risk_score),
+        "status": status
+    }
